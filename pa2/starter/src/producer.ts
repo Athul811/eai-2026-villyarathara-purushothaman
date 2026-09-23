@@ -1,3 +1,4 @@
+
 /**
  * PA2 — producer: HTTP POST /publish -> RabbitMQ.
  *
@@ -72,42 +73,39 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 // ------------------------------------------------------------------ TODO --
 
-/**
- * Open a channel and make sure `queueName` exists as a DURABLE queue —
- * durability is what lets messages already in the queue survive a broker
- * restart. An un-declared or non-durable queue defeats every later
- * demonstration in this assignment before you get to publish anything.
- */
 export async function connectProducerChannel(
   url: string,
   queueName: string,
 ): Promise<ConfirmChannel> {
-  throw new Error("TODO: connectProducerChannel is not implemented");
+  const connection = await amqplib.connect(url);
+  const channel = await connection.createConfirmChannel();
+  await channel.assertQueue(queueName, { durable: true });
+  return channel;
 }
 
-/**
- * Publish `payload` to `queueName`.
- *
- * Two modes, and the difference between them is the actual point of this
- * assignment:
- *   - "confirmed" (the default): publish as a PERSISTENT message and do not
- *     resolve until the broker has confirmed it durably received the
- *     message (a confirm channel gives you a callback for this). Only once
- *     you have that confirmation can you honestly tell the HTTP caller
- *     "this is safely queued".
- *   - "fire-and-forget": publish without waiting for a confirm, and without
- *     the persistent flag. This path exists so you can observe — and then
- *     fix — the failure mode in 04-publisher-confirms-prevents-loss.test.ts:
- *     a message published this way can vanish if the broker goes down
- *     before it's written to disk, and the producer has no way to know.
- */
 export async function publishMessage(
   channel: ConfirmChannel,
   queueName: string,
   payload: unknown,
   options: { correlationId: string; mode: PublishMode },
 ): Promise<void> {
-  throw new Error("TODO: publishMessage is not implemented");
+  const content = Buffer.from(JSON.stringify(payload));
+  const publishOptions = {
+    correlationId: options.correlationId,
+    persistent: options.mode === "confirmed",
+  };
+
+  if (options.mode === "fire-and-forget") {
+    channel.publish("", queueName, content, publishOptions);
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    channel.publish("", queueName, content, publishOptions, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
 }
 
 // -------------------------------------------------------------- http api --
