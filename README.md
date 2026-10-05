@@ -46,6 +46,7 @@ and everything you submit for the rest of the course goes into it.
 eai-2026-<surname>/
   s0/          doctor-output.txt, doctor-screenshot.png
   pa1/ … pa7/  your implementation, plus docs/adr-NNN.md
+  canonical/   copied from this repository at PA4, unchanged
   capstone/    the final integration (PA8)
   README.md    your name, and anything I need to know to run your code
 ```
@@ -54,6 +55,25 @@ Why one repository: your capstone is an integration of your own PA4–PA7 work,
 not a fresh start. By November the code you need is already sitting in the
 repository next to the code you are writing, and the git history is the
 evidence that you wrote it.
+
+### Starting an assignment
+
+Run `git pull` in your clone of this repository, then copy the assignment's
+**whole folder** into your repository, unchanged, and work there:
+
+```bash
+# from the folder that holds both repositories
+cp -r eai-2026/pa4 eai-2026-<surname>/
+cp -r eai-2026/canonical eai-2026-<surname>/    # once, at PA4 — PA5 onward use it too
+```
+
+PowerShell: `Copy-Item -Recurse eai-2026\pa4 eai-2026-<surname>\` (same for
+`canonical`).
+
+Copy the folder, not just `starter/`: the tests, fixtures,
+`docker-compose.yml` and ADR template are part of the assignment, and the
+tests find them by relative path. If a published assignment later gets a
+`## Changes` entry, it names the files that changed — copy those again.
 
 ---
 

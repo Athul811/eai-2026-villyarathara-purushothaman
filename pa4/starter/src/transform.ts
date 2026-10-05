@@ -295,7 +295,7 @@ export async function enrichItems(
 }
 
 /**
- * "2026-09-01T10:30:00Z" style epoch (seconds, UTC) -> ISO-8601.
+ * Unix epoch (seconds, UTC) -> ISO-8601: 1788258600 -> "2026-09-01T10:30:00.000Z".
  *
  * TODO: `new Date(seconds * 1000).toISOString()` is the whole function. The
  * TODO is remembering the *1000 — this is seconds, not milliseconds.
