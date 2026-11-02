@@ -103,6 +103,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/CheckoutResponse"
+        "500":
+          description: The orchestrator hit an unexpected internal error. The idempotency key is released, so the same request can be retried with the same Idempotency-Key.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
   schemas:
     HealthStatus:
@@ -282,7 +288,7 @@ components:
         code:
           type: string
           description: Stable machine-readable error code.
-          enum: [validation_error, idempotency_payload_mismatch, idempotency_conflict]
+          enum: [validation_error, idempotency_payload_mismatch, idempotency_conflict, internal_error]
         message:
           type: string
           description: Human-readable explanation for a developer.
