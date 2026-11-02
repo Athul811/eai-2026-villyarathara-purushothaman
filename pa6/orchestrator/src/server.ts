@@ -173,7 +173,141 @@ app.get("/debug/trace/:orderId", (req: Request, res: Response) => {
   res.status(200).json(saga);
 });
 
-app.post("/checkout", (req: Request, res: Response) => {
+// The contract (openapi.yaml) promises at most 100 items. The canonical schema
+// has no bound, so the service enforces it here. Keep the two numbers equal.
+const MAX_ITEMS = 100;
+
+type StepName =
+  | "payment"
+  | "inventory"
+  | "shipping"
+  | "notification"
+  | "inventory_release"
+  | "payment_refund";
+
+interface StepResult {
+  ok: boolean;
+  timedOut: boolean;
+  code: string;
+}
+
+// One downstream call with a hard timeout. Always records a trace entry.
+async function callDownstream(
+  step: StepName,
+  url: string,
+  body: unknown,
+  trace: TraceItem[],
+): Promise<StepResult> {
+  const startedAt = nowIso();
+  const startMs = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), config.requestTimeoutMs);
+  let result: StepResult = { ok: false, timedOut: false, code: "downstream_unreachable" };
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    if (response.ok) {
+      result = { ok: true, timedOut: false, code: "" };
+    } else {
+      let code = `${step}_failed`;
+      try {
+        const data = (await response.json()) as { code?: unknown };
+        if (typeof data.code === "string" && data.code) {
+          code = data.code;
+        }
+      } catch {
+        // body was not JSON: keep the default code
+      }
+      result = { ok: false, timedOut: false, code };
+    }
+  } catch (err) {
+    const aborted = (err as Error).name === "AbortError";
+    result = {
+      ok: false,
+      timedOut: aborted,
+      code: aborted ? "timeout" : "downstream_unreachable",
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  trace.push({
+    step,
+    status: result.ok ? "success" : result.timedOut ? "timeout" : "failed",
+    startedAt,
+    finishedAt: nowIso(),
+    durationMs: Date.now() - startMs,
+  });
+  return result;
+}
+
+// Money is added as whole cents (integers) and formatted once at the end.
+// Going through parseFloat would turn "18.90" into 1889.9999999999998 cents.
+function toCents(price: string): number {
+  const match = /^(-?)(\d+)\.(\d{2})$/.exec(price);
+  if (!match) {
+    throw new Error(`unitPrice is not a two-digit decimal string: ${price}`);
+  }
+  const cents = parseInt(match[2]!, 10) * 100 + parseInt(match[3]!, 10);
+  return match[1] === "-" ? -cents : cents;
+}
+
+function computeAmount(order: CanonicalOrder): string {
+  let total = 0;
+  for (const item of order.items) {
+    total += toCents(item.unitPrice) * item.quantity;
+  }
+  const negative = total < 0;
+  const abs = Math.abs(total);
+  const whole = Math.floor(abs / 100);
+  const fraction = String(abs % 100).padStart(2, "0");
+  return `${negative ? "-" : ""}${whole}.${fraction}`;
+}
+
+// Persist the finished saga and its idempotency record. Everything here is
+// synchronous (no await between read and write), so two requests finishing at
+// the same time cannot overwrite each other's changes.
+function finishSaga(
+  idempotencyKey: string,
+  requestHash: string,
+  orderId: string,
+  state: SagaState,
+  httpStatus: number,
+  response: unknown,
+  trace: TraceItem[],
+): void {
+  const sagaStore = readJsonFile<SagaStore>(SAGA_STORE_PATH);
+  if (!sagaStore.sagas) {
+    sagaStore.sagas = {};
+  }
+  sagaStore.sagas[orderId] = {
+    idempotencyKey,
+    state,
+    steps: trace,
+    updatedAt: nowIso(),
+  };
+  writeJsonFile(SAGA_STORE_PATH, sagaStore);
+
+  const store = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
+  if (!store.records) {
+    store.records = {};
+  }
+  store.records[idempotencyKey] = {
+    requestHash,
+    state,
+    httpStatus,
+    response,
+    updatedAt: nowIso(),
+  };
+  writeJsonFile(IDEMPOTENCY_STORE_PATH, store);
+}
+
+app.post("/checkout", async (req: Request, res: Response) => {
   const idempotencyKey = req.header("Idempotency-Key");
   if (!idempotencyKey) {
     res.status(400).json({
@@ -192,7 +326,20 @@ app.post("/checkout", (req: Request, res: Response) => {
     return;
   }
 
+  const order = req.body as CanonicalOrder;
+  if (order.items.length > MAX_ITEMS) {
+    res.status(400).json({
+      code: "validation_error",
+      message: `Request body has ${order.items.length} items, the maximum is ${MAX_ITEMS}`,
+    });
+    return;
+  }
+
+  const orderId = order.orderId;
   const requestHash = payloadHash(req.body);
+
+  // Read, check and claim the key with no await in between, so two requests
+  // carrying the same key cannot both pass the check.
   const idempotencyStore = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
   if (!idempotencyStore.records) {
     idempotencyStore.records = {};
@@ -207,85 +354,135 @@ app.post("/checkout", (req: Request, res: Response) => {
       });
       return;
     }
-
-    // Starter behavior for in-progress/previous same-key requests is intentionally minimal.
-    // Students must implement full replay/conflict strategy and document it in the ADR.
-    res.status(409).json({
-      code: "idempotency_conflict",
-      message: "Starter scaffold does not implement duplicate replay handling yet",
-    });
+    if (existing.state === "in_progress") {
+      res.status(409).json({
+        code: "idempotency_conflict",
+        message: "A request with this Idempotency-Key is still in progress",
+      });
+      return;
+    }
+    // Same key, same payload, saga already finished: replay it exactly.
+    res.status(existing.httpStatus).json(existing.response);
     return;
   }
 
-  const order = req.body as CanonicalOrder;
-  const orderId = order.orderId;
   idempotencyStore.records[idempotencyKey] = {
     requestHash,
     state: "in_progress",
     httpStatus: 202,
-    response: {
+    response: { orderId, status: "in_progress" },
+    updatedAt: nowIso(),
+  };
+  writeJsonFile(IDEMPOTENCY_STORE_PATH, idempotencyStore);
+
+  try {
+    const trace: TraceItem[] = [];
+    const completed: StepName[] = [];
+    const amount = computeAmount(order);
+
+    const plan: Array<{ name: StepName; url: string; body: unknown }> = [
+      {
+        name: "payment",
+        url: `${config.paymentUrl}/payment/authorize`,
+        body: { orderId, amount },
+      },
+      {
+        name: "inventory",
+        url: `${config.inventoryUrl}/inventory/reserve`,
+        body: { orderId, items: order.items },
+      },
+      {
+        name: "shipping",
+        url: `${config.shippingUrl}/shipping/create`,
+        body: { orderId },
+      },
+      {
+        name: "notification",
+        url: `${config.notificationUrl}/notification/send`,
+        body: { orderId, recipient: order.customer.email },
+      },
+    ];
+
+    // Strictly one step at a time: each call starts only after the previous
+    // one has succeeded.
+    let failure: StepResult | undefined;
+    for (const step of plan) {
+      const outcome = await callDownstream(step.name, step.url, step.body, trace);
+      if (!outcome.ok) {
+        failure = outcome;
+        break;
+      }
+      completed.push(step.name);
+    }
+
+    // Compensate in reverse order, and only the steps that have an undo action
+    // (shipping and notification have none). A failed undo does not stop the
+    // others from being attempted.
+    let compensationFailed = false;
+    if (failure) {
+      if (completed.includes("inventory")) {
+        const undo = await callDownstream(
+          "inventory_release",
+          `${config.inventoryUrl}/inventory/release`,
+          { orderId },
+          trace,
+        );
+        if (!undo.ok) {
+          compensationFailed = true;
+        }
+      }
+      if (completed.includes("payment")) {
+        const undo = await callDownstream(
+          "payment_refund",
+          `${config.paymentUrl}/payment/refund`,
+          { orderId },
+          trace,
+        );
+        if (!undo.ok) {
+          compensationFailed = true;
+        }
+      }
+    }
+
+    let httpStatus: number;
+    let state: SagaState;
+    let code: string | undefined;
+    if (!failure) {
+      httpStatus = 200;
+      state = "completed";
+    } else if (compensationFailed) {
+      httpStatus = 422;
+      state = "failed";
+      code = "compensation_failed";
+    } else {
+      httpStatus = failure.timedOut ? 504 : 422;
+      state = completed.length === 0 ? "failed" : "compensated";
+      code = failure.code;
+    }
+
+    const response = {
       orderId,
-      status: "in_progress",
-    },
-    updatedAt: nowIso(),
-  };
-  writeJsonFile(IDEMPOTENCY_STORE_PATH, idempotencyStore);
+      status: state,
+      ...(code ? { code } : {}),
+      trace,
+    };
 
-  // --------------------------------------------------------------------------
-  // TODO (student): Implement full orchestration flow. README.md §4 has the
-  // exact request bodies, trace step names and the outcome table.
-  //   1) payment authorize   { orderId, amount }
-  //   2) inventory reserve   { orderId, items }
-  //   3) shipping create     { orderId }
-  //   4) notification send   { orderId, recipient }
-  // with strict sequencing, trace recording, timeout handling, compensation
-  // (in reverse order of the steps that actually completed), idempotent
-  // replay policy, and restart-safe persistence updates.
-  //
-  // The canonical order carries neither an amount nor a recipient:
-  //   - amount    = the sum of unitPrice × quantity over order.items, sent as
-  //                 a decimal string with two fraction digits ("49.50").
-  //                 unitPrice is already a string: add up whole cents as
-  //                 integers, then format once. Never go through a float.
-  //   - recipient = order.customer.email
-  //
-  // config.paymentUrl / config.inventoryUrl / config.shippingUrl /
-  // config.notificationUrl / config.requestTimeoutMs are already loaded from
-  // the environment above — use them, do not hardcode downstream URLs.
-  // --------------------------------------------------------------------------
-
-  const trace: TraceItem[] = [];
-
-  const scaffoldResponse = {
-    orderId,
-    status: "failed" as const,
-    code: "not_implemented",
-    message: "Implement orchestration logic in orchestrator/src/server.ts",
-    trace,
-  };
-
-  const sagaStore = readJsonFile<SagaStore>(SAGA_STORE_PATH);
-  if (!sagaStore.sagas) {
-    sagaStore.sagas = {};
+    finishSaga(idempotencyKey, requestHash, orderId, state, httpStatus, response, trace);
+    res.status(httpStatus).json(response);
+  } catch (err) {
+    // Unexpected error: release the key so the caller can retry instead of
+    // being stuck behind a permanent in_progress record.
+    const store = readJsonFile<IdempotencyStore>(IDEMPOTENCY_STORE_PATH);
+    if (store.records) {
+      delete store.records[idempotencyKey];
+      writeJsonFile(IDEMPOTENCY_STORE_PATH, store);
+    }
+    console.error("[orchestrator] unexpected error", err);
+    res.status(500).json({
+      code: "internal_error",
+      message: "Unexpected error while running the checkout",
+    });
   }
-  sagaStore.sagas[orderId] = {
-    idempotencyKey,
-    state: "failed",
-    steps: trace,
-    updatedAt: nowIso(),
-  };
-  writeJsonFile(SAGA_STORE_PATH, sagaStore);
-
-  idempotencyStore.records[idempotencyKey] = {
-    requestHash,
-    state: "failed",
-    httpStatus: 422,
-    response: scaffoldResponse,
-    updatedAt: nowIso(),
-  };
-  writeJsonFile(IDEMPOTENCY_STORE_PATH, idempotencyStore);
-
-  res.status(422).json(scaffoldResponse);
 });
 
 bootstrapStores();
