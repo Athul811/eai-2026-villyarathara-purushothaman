@@ -1,3 +1,8 @@
 import { createService } from "../../shared/service";
-const { start } = createService();
-start();
+import { randomUUID } from "node:crypto";
+
+const { app, broker, start } = createService();
+
+const orders = new Map<string, unknown>();
+
+app.use(express.json());

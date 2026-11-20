@@ -14,6 +14,18 @@ export class Broker {
   private setups: Setup[] = [];
   constructor(private url: string) {}
 
+async publish(exchange: string, message: unknown, options: amqp.Options.Publish = {}): Promise<void> {
+  if (!this.ch || !this.up) {
+    throw new Error("RabbitMQ is not connected");
+  }
+
+  this.ch.publish(
+    exchange,
+    "",
+    Buffer.from(JSON.stringify(message)),
+    { persistent: true, contentType: "application/json", ...options }
+  );
+}
   consume(
     queue: string,
     handler: (msg: ConsumeMessage, ch: Channel) => Promise<void> | void,
