@@ -1,3 +1,4 @@
+import { makeHop, emitHop, attachTrace } from "./hops.js";
 import express from "express";
 import amqp from "amqplib";
 import Ajv from "ajv";
@@ -94,7 +95,21 @@ app.get("/orders/:cid", (req, res) => {
   v ? res.json(v) : res.status(404).json({ code: "not_found" });
 });
 
+function makeTrace(cid) {
+  let last = null;
+  const hops = [];
+  return {
+    add(operation, status, startedAt, opts = {}) {
+      const h = makeHop({ service: "intake", operation, status, correlationId: cid, causationId: last,
+        startedAt, hopId: opts.hopId, detail: opts.detail });
+      hops.push(h); last = h.hopId; return h.hopId;
+    },
+    flush() { for (const h of hops) emitHop(h); },
+  };
+}
+
 app.post("/orders", express.raw({ type: () => true, limit: "2mb" }), async (req, res) => {
+  const reqStart = new Date();
   const key = req.get("Idempotency-Key");
   const reply = (status, body, headers = {}) => res.status(status).set(headers).json(body);
   if (!key || !/^[A-Za-z0-9._:-]{1,128}$/.test(key))
@@ -107,7 +122,7 @@ app.post("/orders", express.raw({ type: () => true, limit: "2mb" }), async (req,
   if (rec) {
     if (rec.bodySha256 !== sha) return reply(409, { code: "idempotency_payload_mismatch" });
     if (rec.state === "in_flight") return reply(409, { code: "idempotency_conflict" });
-    return reply(rec.response.status, rec.response.body);          // R-4.1.13: replay, publish nothing
+    return reply(rec.response.status, rec.response.body);
   }
   idem[key] = { bodySha256: sha, state: "in_flight", createdAt: new Date().toISOString() };
   save("idempotency-store.json", idem);
@@ -119,42 +134,54 @@ app.post("/orders", express.raw({ type: () => true, limit: "2mb" }), async (req,
     return reply(status, body2);
   };
 
+  let T = null;
   try {
     const correlationId = randomUUID();
     const enrichHop = randomUUID();
     const publishHop = randomUUID();
+    T = makeTrace(correlationId);
+    T.add("intake.receive", "success", reqStart);
 
-    // detect + translate
-    const order = detectAndTranslate(req.get("Content-Type"), body);
+    const tStart = new Date();
+    let order;
+    try { order = detectAndTranslate(req.get("Content-Type"), body); }
+    catch (e) { T.add("intake.translate", "failed", tStart, { detail: { code: e?.code ?? "validation_error" } }); throw e; }
+    T.add("intake.translate", "success", tStart, { detail: { source: order.source } });
 
-    // enrich
+    const eStart = new Date();
     const ids = [...new Set(order.items.map((i) => i.productId))];
     const results = await Promise.all(ids.map((id) => price(id, correlationId, enrichHop)));
     const byId = Object.fromEntries(ids.map((id, i) => [id, results[i]]));
     if (results.some((r) => r.outage)) {
+      T.add("intake.enrich", "failed", eStart, { hopId: enrichHop, detail: { code: "pricing_unavailable" } });
       release();
       return reply(503, { code: "pricing_unavailable" }, { "Retry-After": "1" });
     }
     const unknown = ids.filter((id) => byId[id].unknown);
-    if (unknown.length) return finish(422, { code: "unknown_product", productIds: unknown });
+    if (unknown.length) {
+      T.add("intake.enrich", "failed", eStart, { hopId: enrichHop, detail: { code: "unknown_product", productIds: unknown } });
+      return finish(422, { code: "unknown_product", productIds: unknown });
+    }
+    T.add("intake.enrich", "success", eStart, { hopId: enrichHop });
     order.items = order.items.map((i) => ({ ...i, unitPrice: byId[i.productId].unitPrice,
       currency: byId[i.productId].currency, taxRate: byId[i.productId].taxRate }));
 
-    // validate
     if (!validateOrder(order) || order.items.length > ITEMS_MAX) {
       release();
       const msg = order.items.length > ITEMS_MAX ? "too many items" : ajv.errorsText(validateOrder.errors);
       return reply(400, { code: "validation_error", message: msg });
     }
 
-    // publish, answer only after the broker confirmed
     const businessKey = `${order.source}:${order.orderId}`;
+    const pStart = new Date();
     try {
       await publishAccepted(order, { correlationId, causationId: publishHop, businessKey });
     } catch {
+      T.add("intake.publish", "failed", pStart, { hopId: publishHop, detail: { code: "broker_unavailable" } });
       release();
       return reply(503, { code: "broker_unavailable" }, { "Retry-After": "1" });
     }
+    T.add("intake.publish", "success", pStart, { hopId: publishHop });
     if (!orders[correlationId]) orders[correlationId] = { correlationId, businessKey, orderId: order.orderId, source: order.source,
       orderType: order.orderType, state: "accepted", updatedAt: new Date().toISOString() };
     save("orders.json", orders);
@@ -166,8 +193,11 @@ app.post("/orders", express.raw({ type: () => true, limit: "2mb" }), async (req,
     if (e?.http) return reply(e.http, { code: e.code, message: e.message });
     console.error(e);
     return reply(500, { code: "internal_error" });
+  } finally {
+    T?.flush();
   }
 });
+
 
 app.listen(PORT, () => console.log(`intake listening on ${PORT}`));
 
@@ -180,6 +210,7 @@ const MOVES = {
   needs_attention: ["compensated", "compensation_failed"],
 };
 async function startOutcomeConsumer() {
+  await attachTrace(conn);
   const oc = await conn.createChannel();
   oc.on("error", () => {});
   oc.on("close", () => { outcomeUp = false; });
@@ -270,7 +301,7 @@ app.post("/dlq/replay", express.json(), async (req, res) => {
           const e = entryOf(m);
           if ((want && e.correlationId !== want) || !e.originQueue) { rc.nack(m, false, true); continue; }
           const headers = withoutRetryHistory(m.properties.headers);
-          headers.causationId = randomUUID();                // the dlq.replay hop (step 5 will record it)
+          const rh = randomUUID(); headers.causationId = rh; emitHop(makeHop({ service: "intake", operation: "dlq.replay", correlationId: e.correlationId, causationId: m.properties.headers?.causationId ?? null, hopId: rh, startedAt: new Date(), detail: { originQueue: e.originQueue } }));
           try {
             await confirmPublish("orders.return.exchange", e.originQueue, m.content, {
               persistent: true, messageId: randomUUID(), headers,

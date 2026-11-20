@@ -1,3 +1,4 @@
+import { makeHop, emitHop, attachTrace } from "./hops.js";
 import express from "express";
 import amqp from "amqplib";
 import { randomUUID } from "node:crypto";
@@ -37,6 +38,7 @@ async function connect() {
     conn.on("error", () => {});
     conn.on("close", () => { conn = null; ch = null; consuming = false; setTimeout(connect, 1000); });
     ch = await conn.createConfirmChannel();
+    await attachTrace(conn);
     ch.on("error", () => {});
     ch.on("close", () => { ch = null; consuming = false; conn?.close().catch(() => {}); });
     await ch.prefetch(10);
@@ -67,11 +69,11 @@ async function quarantine(msg) {
   ack(msg);
 }
 
-async function send(ev, cid) {
+async function send(ev, cid, causationId) {
   try {
     const r = await fetch(`${NOTIFICATION_URL}/notification/send`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Correlation-Id": cid, "X-Causation-Id": randomUUID() },
+      headers: { "Content-Type": "application/json", "X-Correlation-Id": cid, "X-Causation-Id": causationId },
       body: JSON.stringify({ orderId: ev.orderId, recipient: ev.recipient, kind: "order_not_completed", reason: ev.code }),
       signal: AbortSignal.timeout(TIMEOUT),
     });
@@ -84,26 +86,44 @@ async function send(ev, cid) {
 async function handle(msg) {
   const h = msg.properties.headers || {};
   const cid = h.correlationId ? String(h.correlationId) : null;
+  const attempt = retryCount(h) + 1;
   let ev;
   try {
     ev = JSON.parse(msg.content.toString("utf8"));
     if (!cid || !ev || typeof ev !== "object" || !ev.orderId || !ev.recipient) throw new Error("invalid");
-  } catch { return quarantine(msg); }
+  } catch {
+    if (cid) emitHop(makeHop({ service: "notifier", operation: "invalid.quarantine", status: "quarantined", correlationId: cid,
+      causationId: h.causationId ?? null, messageId: msg.properties.messageId, startedAt: new Date() }));
+    return quarantine(msg);
+  }
 
-  if (processed.has(cid)) return ack(msg);               // R-4.5.3: check before send
+  let last = h.causationId ?? null;
+  const hop = (operation, status, t0, o = {}) => {
+    const x = makeHop({ service: "notifier", operation, status, correlationId: cid,
+      causationId: o.causedBy !== undefined ? o.causedBy : last, attempt, messageId: msg.properties.messageId,
+      startedAt: t0, hopId: o.hopId, detail: o.detail });
+    emitHop(x); last = x.hopId; return x.hopId;
+  };
+  const consume = hop("notify.consume", "success", new Date());
 
-  const r = await send(ev, cid);
+  if (processed.has(cid)) { hop("notify.duplicate", "duplicate", new Date()); return ack(msg); }
+
+  const sid = randomUUID(); const t0 = new Date();
+  const r = await send(ev, cid, sid);
+  hop("notify.send", r.ok ? "success" : (r.error === "timeout" ? "timeout" : "failed"), t0,
+    { hopId: sid, detail: r.ok ? undefined : { code: r.error } });
   if (r.ok) {
     appendFileSync(`${DATA_DIR}/notification.log`, JSON.stringify({ at: now(), correlationId: cid,
       orderId: ev.orderId, recipient: ev.recipient, kind: "order_not_completed", reason: ev.code }) + "\n");
-    processed.add(cid); saveProcessed();                  // record after a successful send
+    processed.add(cid); saveProcessed();
     return ack(msg);
   }
-  const attempts = retryCount(h) + 1;
-  if (attempts < MAX_RETRIES) return nack(msg);           // retry path
+  const attempts = attempt;
+  if (attempts < MAX_RETRIES) { hop("notify.retry", "retried", new Date(), { causedBy: consume }); return nack(msg); }
+  const dl = hop("notify.dead_letter", "dead_lettered", new Date(), { causedBy: consume, detail: { code: r.error } });
   await confirmPub("orders.dlq.exchange", "", msg.content, {
     persistent: true, messageId: randomUUID(), contentType: "application/json",
-    headers: { correlationId: cid, causationId: randomUUID(), originQueue: "notifications.queue",
+    headers: { correlationId: cid, causationId: dl, originQueue: "notifications.queue",
       lastError: r.error, attempts, deadLetteredAt: now() },
   });
   ack(msg);

@@ -1,3 +1,4 @@
+import { makeHop, emitHop, attachTrace } from "./hops.js";
 import express from "express";
 import amqp from "amqplib";
 import Ajv from "ajv";
@@ -28,6 +29,17 @@ const validate = ajv.compile(JSON.parse(readFileSync("/canonical/order.schema.js
 const OUTCOME_STATES = new Set(["completed", "failed", "compensated", "compensation_failed", "needs_attention", "duplicate"]);
 const running = new Set();
 const compensating = new Set();
+const traces = new Map();
+function mkTrace(cid, cause, attempt = 1, messageId) {
+  const T = { last: cause ?? null, consume: null,
+    add(operation, status, startedAt, o = {}) {
+      const h = makeHop({ service: "orchestrator", operation, status, correlationId: cid,
+        causationId: o.causedBy !== undefined ? o.causedBy : T.last, attempt, messageId,
+        startedAt, hopId: o.hopId, detail: o.detail });
+      emitHop(h); T.last = h.hopId; return h.hopId;
+    } };
+  return T;
+}
 
 let conn = null, ch = null, consuming = false, scanned = false;
 function confirmPub(exchange, key, content, options) {
@@ -38,9 +50,9 @@ function confirmPub(exchange, key, content, options) {
     catch (e) { clearTimeout(t); reject(e); }
   });
 }
-const pubOutcome = (rk, env) => confirmPub("orders.outcome", rk, Buffer.from(JSON.stringify(env)),
+const pubOutcome = (rk, env, causationId = randomUUID()) => confirmPub("orders.outcome", rk, Buffer.from(JSON.stringify(env)),
   { persistent: true, contentType: "application/json", messageId: randomUUID(),
-    headers: { correlationId: env.correlationId, causationId: randomUUID() } });
+    headers: { correlationId: env.correlationId, causationId } });
 const ack = (m) => { try { ch.ack(m); } catch {} };
 const nack = (m) => { try { ch.nack(m, false, false); } catch {} };
 
@@ -50,6 +62,7 @@ async function connect() {
     conn.on("error", () => {});
     conn.on("close", () => { conn = null; ch = null; consuming = false; setTimeout(connect, 1000); });
     ch = await conn.createConfirmChannel();
+    await attachTrace(conn);
     ch.on("error", () => {});
     ch.on("close", () => { ch = null; consuming = false; conn?.close().catch(() => {}); });
     if (!scanned) { scanned = true; await scanStuck(); }
@@ -92,11 +105,11 @@ const COMP = {
   payment: { name: "payment_refund", spec: (id, bk) => ({ url: `${URLS.payment}/payment/refund`, key: `refund:${bk}`, body: { orderId: id } }) },
 };
 
-async function call(spec, cid) {
+async function call(spec, cid, causationId = randomUUID()) {
   try {
     const r = await fetch(spec.url, {
       method: "POST",
-      headers: { "Content-Type": "application/json", "X-Correlation-Id": cid, "X-Causation-Id": randomUUID(),
+      headers: { "Content-Type": "application/json", "X-Correlation-Id": cid, "X-Causation-Id": causationId,
         ...(spec.key ? { "Idempotency-Key": spec.key } : {}) },
       body: JSON.stringify(spec.body), signal: AbortSignal.timeout(TIMEOUT),
     });
@@ -113,7 +126,9 @@ async function runComps(cid, saga, ctx) {
     if (!saga.steps.some((x) => x.step === s && x.status === "ok")) continue;
     const c = COMP[s];
     if (saga.compensations.some((x) => x.step === c.name && x.status === "ok")) continue;
-    const r = await call(c.spec(ctx.orderId, ctx.businessKey), cid);
+    const T = traces.get(cid) || mkTrace(cid, null, 1); const hid = randomUUID(); const c0 = new Date();
+    const r = await call(c.spec(ctx.orderId, ctx.businessKey), cid, hid);
+    T.add(c.name, r.ok ? "success" : "failed", c0, { hopId: hid, detail: r.ok ? undefined : { code: r.code } });
     saga.compensations.push({ step: c.name, status: r.ok ? "ok" : "failed", at: now() });
     persist();
     if (!r.ok) return { ok: false, code: r.code };
@@ -124,7 +139,9 @@ async function runComps(cid, saga, ctx) {
 async function setOutcome(cid, saga, rk, env) {
   saga.state = env.state; saga.outcome = { routingKey: rk, envelope: env }; saga.updatedAt = now();
   persist();
-  await pubOutcome(rk, env);
+  const T = traces.get(cid) || mkTrace(cid, null, 1, undefined);
+  const hid = T.add("saga.outcome", "success", new Date(), { detail: { state: env.state, ...(env.code ? { code: env.code } : {}) } });
+  await pubOutcome(rk, env, hid);
 }
 
 const retryCount = (h) => {
@@ -138,7 +155,9 @@ async function scanStuck() {
     if (s.state === "processing" && s.owner !== RUN_ID && s.steps.some((x) => x.status === "ok")) {
       const env = { ...s.outcome.envelope, state: "needs_attention", occurredAt: now() };
       delete env.code;
+      const T0 = mkTrace(cid, null, 1); traces.set(cid, T0); T0.add("saga.stuck", "success", new Date());
       await setOutcome(cid, s, "order.needs_attention", env);
+      traces.delete(cid);
     }
   }
 }
@@ -150,22 +169,37 @@ async function quarantine(msg) {
 }
 
 async function handle(msg) {
+  const hh = msg.properties.headers || {};
+  const key = hh.correlationId ? String(hh.correlationId) : null;
+  try { await handleInner(msg); } finally { if (key) traces.delete(key); }
+}
+
+async function handleInner(msg) {
   const h = msg.properties.headers || {};
   const cid = h.correlationId ? String(h.correlationId) : null;
   let order;
   try {
     order = JSON.parse(msg.content.toString("utf8"));
     if (!cid || !validate(order)) throw new Error("invalid");
-  } catch { return quarantine(msg); }
+  } catch {
+    if (cid) emitHop(makeHop({ service: "orchestrator", operation: "invalid.quarantine", status: "quarantined", correlationId: cid,
+      causationId: h.causationId ?? null, messageId: msg.properties.messageId, startedAt: new Date() }));
+    return quarantine(msg);
+  }
 
   const ctx = ctxOf(order);
+  const T = mkTrace(cid, h.causationId ?? null, retryCount(h) + 1, msg.properties.messageId);
+  traces.set(cid, T);
+  const consumeHop = T.add("saga.consume", "success", new Date());
+  T.consume = consumeHop;
   if (running.has(cid)) return ack(msg);
   let saga = store.sagas[cid];
   let fresh = false;
 
   if (saga) {
     if (OUTCOME_STATES.has(saga.state)) {
-      await pubOutcome(saga.outcome.routingKey, saga.outcome.envelope);
+      const rd = T.add("saga.dedupe", "skipped", new Date(), { detail: { reason: "redelivery" } });
+      await pubOutcome(saga.outcome.routingKey, saga.outcome.envelope, rd);
       return ack(msg);
     }
     if (saga.state === "processing" && saga.owner !== RUN_ID && saga.steps.some((x) => x.status === "ok")) {
@@ -179,7 +213,8 @@ async function handle(msg) {
       saga = store.sagas[cid] = { businessKey: ctx.businessKey, state: "duplicate", steps: [], compensations: [],
         outcome: { routingKey: "order.duplicate", envelope: env }, owner: RUN_ID, updatedAt: now() };
       persist();
-      await pubOutcome("order.duplicate", env);
+      const dd = T.add("saga.dedupe", "duplicate", new Date(), { detail: { duplicateOf: first } });
+      await pubOutcome("order.duplicate", env, dd);
       return ack(msg);
     }
     store.businessKeys[ctx.businessKey] = cid;
@@ -197,7 +232,7 @@ async function handle(msg) {
       const env = envelope(ctx, cid, "processing");
       saga.state = "processing"; saga.outcome = { routingKey: "order.processing", envelope: env }; saga.updatedAt = now();
       persist();
-      await pubOutcome("order.processing", env);
+      await pubOutcome("order.processing", env, consumeHop);
     } else persist();
     await runSaga(msg, order, cid, saga, ctx, h);
   } finally { running.delete(cid); }
@@ -208,15 +243,21 @@ async function runSaga(msg, order, cid, saga, ctx, h) {
     : ["payment", "inventory", "shipping", "notification"];
   for (let i = 0; i < seq.length; i++) {
     const step = seq[i];
-    const r = await call(STEP[step](order, ctx.businessKey), cid);
+    const T = traces.get(cid); const hid = randomUUID(); const s0 = new Date();
+    const r = await call(STEP[step](order, ctx.businessKey), cid, hid);
+    T.add(step, r.ok ? "success" : (r.code === "timeout" ? "timeout" : "failed"), s0, { hopId: hid, detail: r.ok ? undefined : { code: r.code } });
     if (r.ok) { saga.steps.push({ step, status: "ok", at: now() }); persist(); continue; }
 
     if (i === 0) {
       if (r.temp) {
         const attempts = retryCount(h) + 1;
-        if (attempts < MAX_RETRIES) return nack(msg);
+        if (attempts < MAX_RETRIES) {
+          T.add("saga.retry", "retried", new Date(), { causedBy: T.consume, detail: { code: r.code } });
+          return nack(msg);
+        }
+        const dl = T.add("saga.dead_letter", "dead_lettered", new Date(), { causedBy: T.consume, detail: { code: r.code } });
         await confirmPub("orders.dlq.exchange", "", msg.content, { persistent: true, messageId: randomUUID(),
-          headers: { ...h, originQueue: "saga.queue", attempts, lastError: r.code, causationId: randomUUID() } });
+          headers: { ...h, originQueue: "saga.queue", attempts, lastError: r.code, causationId: dl } });
         await setOutcome(cid, saga, "order.parked", envelope(ctx, cid, "parked", { code: r.code }));
         return ack(msg);
       }
@@ -261,6 +302,7 @@ app.post("/sagas/:cid/compensate", async (req, res) => {
   if (s.state !== "needs_attention" && s.state !== "compensation_failed")
     return res.status(409).json({ code: "saga_not_stuck" });
   compensating.add(cid);
+  traces.set(cid, mkTrace(cid, null, 1)); traces.get(cid).add("saga.operator_compensate", "success", new Date());
   try {
     const prev = s.state, ctx = { ...s.outcome.envelope };
     const r = await runComps(cid, s, ctx);
@@ -275,7 +317,7 @@ app.post("/sagas/:cid/compensate", async (req, res) => {
     res.json({ correlationId: cid, state });
   } catch (e) {
     console.error(e); res.status(500).json({ code: "internal_error" });
-  } finally { compensating.delete(cid); }
+  } finally { compensating.delete(cid); traces.delete(cid); }
 });
 
 app.listen(PORT, () => console.log(`orchestrator listening on ${PORT}`));
