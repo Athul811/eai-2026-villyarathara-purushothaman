@@ -1,33 +1,21 @@
 # AI usage
 
-<!--
-How you used AI tools on the capstone (README §6, R-6.7). Keep the five ##
-headings as they are; the stage 6 tests check that each has text of yours
-under it. No points depend on how much or how little you used them. The
-defence asks about this document: you explain your own system, whoever typed
-it.
--->
-
 ## Tools used
 
-<!-- Which tools, and which versions or models, if you know them. "None" is an answer. -->
+Claude (Anthropic), in the claude.ai chat, for guidance during the capstone.
 
 ## What for
 
-<!-- Which parts of the capstone: code, which services, tests, documents, debugging. -->
+Planning the order of work from the brief and grading rules, the first version of the shared broker helper and the Dockerfiles for step 0, the structure of the runbook, and a first draft of agent-readiness.md. <add anything else you really used it for>
 
 ## What I changed or rejected
 
-<!-- Concrete cases: a suggestion that was wrong, what was wrong with it, and what you did instead. -->
+I replaced the step 0 skeleton with my own JavaScript services (server.js, translate.js, hops.js), so the generated src/ stubs were dead code and I deleted them. <add what you rewrote in the runbook and agent-readiness.md>
 
 ## What I verified, and how
 
-<!-- How you know the result works: which tests, which checks by hand, which traces you read. -->
+I ran node tests/stage.mjs for stages 0 to 5 (28 passed) on a rebuilt stack, checked docker compose ps for healthy containers, and read the generated text against my own code before keeping it. <add specific checks, e.g. the 409 on a non-stuck saga>
 
 ## Dependencies beyond the allow-list
 
-<!--
-Every dependency outside README R-5.5.1's list, each with its reason
-(R-5.5.2). "None" if there are none. The forbidden ones (R-5.5.3) cannot be
-listed here: they are not allowed at all.
--->
+<none, or list each package outside the README's allow-list, and why>
