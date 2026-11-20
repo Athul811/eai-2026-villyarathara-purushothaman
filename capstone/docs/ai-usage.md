@@ -6,13 +6,13 @@ ChatGPT (OpenAI) and Claude (Anthropic). I used Claude in the claude.ai chat acr
 
 ## What for
 
-ChatGPT: <WRITE what you used it for>.
-Claude, earlier conversations: <WRITE what these produced>.
+ChatGPT: help with parts of the capstone code and documents. I do not have a record of each prompt, so this list is incomplete.
+Claude, earlier conversations on other accounts: help with parts of the capstone services and documents. I do not have a record of each conversation, so this list is incomplete.
 Claude, the final conversation: the order of work from the brief and the grading rules, a first skeleton of four services with a shared broker helper and Dockerfiles for step 0, the heading structure of runbook.md, a first draft of agent-readiness.md, and first drafts of ADR-007 to ADR-010, written from code lines and test output that I pasted in.
 
 ## What I changed or rejected
 
-I replaced the step 0 skeleton with my own JavaScript services (server.js, translate.js, hops.js), so the generated src/ stubs were dead code and I deleted them. In ADR-010 I added what I observed in my own kill test: after killing the orchestrator during a slow shipping call, the saga was needs_attention with payment and inventory done, and shipping still created a shipment about five seconds later. I removed three sentences from the ADR drafts that the AI had guessed and I had not checked. <WRITE anything you changed or fixed in code from the other tools, or delete this sentence>
+I replaced the step 0 skeleton with my own JavaScript services (server.js, translate.js, hops.js), so the generated src/ stubs were dead code and I deleted them. In ADR-010 I added what I observed in my own kill test: after killing the orchestrator during a slow shipping call, the saga was needs_attention with payment and inventory done, and shipping still created a shipment about five seconds later. I removed three sentences from the ADR drafts that the AI had guessed and I had not checked. I ran the stage tests after each step and fixed the failures they reported.
 
 ## What I verified, and how
 
