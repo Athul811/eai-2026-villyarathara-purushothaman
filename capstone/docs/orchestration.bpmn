@@ -1,28 +1,101 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  The saga as a BPMN 2.0 process (README §6, R-6.2). An empty diagram: open
-  this file in https://demo.bpmn.io or in Camunda Modeler, draw your saga,
-  save it here, and export the picture next to it as orchestration.svg
-  (or orchestration.png).
-
-  It needs: a message start event (order.accepted); the b2b exclusive gateway;
-  one task per step; error boundary events on the steps that can fail; timer
-  boundary events for the timeouts; the compensation (compensation boundary
-  events and tasks marked "for compensation"); and one end event per outcome.
-
-  The stage 6 tests check that this is BPMN 2.0 XML with an error boundary
-  event, compensation and an exclusive gateway, and that the picture exists.
-  The notation is discussed at the defence.
--->
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" id="Definitions_capstone" targetNamespace="http://bpmn.io/schema/bpmn">
-  <bpmn:process id="Process_checkout" name="Checkout saga" isExecutable="false">
-    <bpmn:startEvent id="StartEvent_1" />
-  </bpmn:process>
-  <bpmndi:BPMNDiagram id="BPMNDiagram_1">
-    <bpmndi:BPMNPlane id="BPMNPlane_1" bpmnElement="Process_checkout">
-      <bpmndi:BPMNShape id="StartEvent_1_di" bpmnElement="StartEvent_1">
-        <dc:Bounds x="152" y="102" width="36" height="36" />
-      </bpmndi:BPMNShape>
-    </bpmndi:BPMNPlane>
-  </bpmndi:BPMNDiagram>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" id="Definitions_1" targetNamespace="http://bpmn.io/schema/bpmn">
+<bpmn:message id="Msg_accepted" name="order.accepted"/>
+<bpmn:error id="Err_provider" name="provider rejects" errorCode="4xx"/>
+<bpmn:error id="Err_step" name="step fails" errorCode="step_failed"/>
+<bpmn:process id="checkout" name="Checkout saga" isExecutable="false">
+<bpmn:documentation>Simplified view of the saga. A b2b order skips payment. For b2b the first step is inventory, and its failure follows the first-step path (failed, or retry then parked) instead of the compensation path. The needs_attention outcome (crash detection) is operational and is not modelled here.</bpmn:documentation>
+<bpmn:startEvent id="Start" name="order.accepted from saga.queue"><bpmn:messageEventDefinition messageRef="Msg_accepted"/></bpmn:startEvent>
+<bpmn:exclusiveGateway id="GwDup" name="businessKey already seen?"/>
+<bpmn:exclusiveGateway id="GwB2b" name="orderType is b2b?"/>
+<bpmn:serviceTask id="Payment" name="payment: authorize"/>
+<bpmn:serviceTask id="Inventory" name="inventory: reserve"/>
+<bpmn:serviceTask id="Shipping" name="shipping: create"/>
+<bpmn:serviceTask id="Notification" name="notification: send"/>
+<bpmn:boundaryEvent id="PayErr" name="declined (4xx)" attachedToRef="Payment"><bpmn:errorEventDefinition errorRef="Err_provider"/></bpmn:boundaryEvent>
+<bpmn:boundaryEvent id="PayTimer" name="5xx or timeout: retry path" attachedToRef="Payment"><bpmn:timerEventDefinition><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT2.5S</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+<bpmn:boundaryEvent id="PayComp" name="compensable" attachedToRef="Payment"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+<bpmn:boundaryEvent id="InvErr" name="inventory fails" attachedToRef="Inventory"><bpmn:errorEventDefinition errorRef="Err_step"/></bpmn:boundaryEvent>
+<bpmn:boundaryEvent id="InvComp" name="compensable" attachedToRef="Inventory"><bpmn:compensateEventDefinition/></bpmn:boundaryEvent>
+<bpmn:boundaryEvent id="ShipErr" name="shipping fails" attachedToRef="Shipping"><bpmn:errorEventDefinition errorRef="Err_step"/></bpmn:boundaryEvent>
+<bpmn:boundaryEvent id="ShipTimer" name="timeout" attachedToRef="Shipping"><bpmn:timerEventDefinition><bpmn:timeDuration xsi:type="bpmn:tFormalExpression">PT2.5S</bpmn:timeDuration></bpmn:timerEventDefinition></bpmn:boundaryEvent>
+<bpmn:boundaryEvent id="NotErr" name="notification fails" attachedToRef="Notification"><bpmn:errorEventDefinition errorRef="Err_step"/></bpmn:boundaryEvent>
+<bpmn:serviceTask id="HRefund" name="payment: refund" isForCompensation="true"/>
+<bpmn:serviceTask id="HRelease" name="inventory: release" isForCompensation="true"/>
+<bpmn:intermediateThrowEvent id="ThrowComp" name="compensate completed steps, reverse order"><bpmn:compensateEventDefinition/></bpmn:intermediateThrowEvent>
+<bpmn:exclusiveGateway id="GwComp" name="all compensations succeeded?"/>
+<bpmn:endEvent id="EndCompleted" name="completed"/>
+<bpmn:endEvent id="EndDuplicate" name="duplicate"/>
+<bpmn:endEvent id="EndFailed" name="failed"/>
+<bpmn:endEvent id="EndParked" name="parked (DLQ)"/>
+<bpmn:endEvent id="EndCompensated" name="compensated"/>
+<bpmn:endEvent id="EndCompFailed" name="compensation_failed"/>
+<bpmn:sequenceFlow id="f1" sourceRef="Start" targetRef="GwDup"/>
+<bpmn:sequenceFlow id="f2" sourceRef="GwDup" targetRef="GwB2b" name="no"/>
+<bpmn:sequenceFlow id="f3" sourceRef="GwDup" targetRef="EndDuplicate" name="yes"/>
+<bpmn:sequenceFlow id="f4" sourceRef="GwB2b" targetRef="Payment" name="standard or express"/>
+<bpmn:sequenceFlow id="f5" sourceRef="GwB2b" targetRef="Inventory" name="b2b: no payment"/>
+<bpmn:sequenceFlow id="f6" sourceRef="Payment" targetRef="Inventory"/>
+<bpmn:sequenceFlow id="f7" sourceRef="Inventory" targetRef="Shipping"/>
+<bpmn:sequenceFlow id="f8" sourceRef="Shipping" targetRef="Notification"/>
+<bpmn:sequenceFlow id="f9" sourceRef="Notification" targetRef="EndCompleted"/>
+<bpmn:sequenceFlow id="f10" sourceRef="PayErr" targetRef="EndFailed"/>
+<bpmn:sequenceFlow id="f11" sourceRef="PayTimer" targetRef="EndParked"/>
+<bpmn:sequenceFlow id="f12" sourceRef="InvErr" targetRef="ThrowComp"/>
+<bpmn:sequenceFlow id="f13" sourceRef="ShipErr" targetRef="ThrowComp"/>
+<bpmn:sequenceFlow id="f14" sourceRef="ShipTimer" targetRef="ThrowComp"/>
+<bpmn:sequenceFlow id="f15" sourceRef="NotErr" targetRef="ThrowComp"/>
+<bpmn:sequenceFlow id="f16" sourceRef="ThrowComp" targetRef="GwComp"/>
+<bpmn:sequenceFlow id="f17" sourceRef="GwComp" targetRef="EndCompensated" name="yes"/>
+<bpmn:sequenceFlow id="f18" sourceRef="GwComp" targetRef="EndCompFailed" name="no"/>
+<bpmn:association id="a1" associationDirection="One" sourceRef="PayComp" targetRef="HRefund"/>
+<bpmn:association id="a2" associationDirection="One" sourceRef="InvComp" targetRef="HRelease"/>
+</bpmn:process>
+<bpmndi:BPMNDiagram id="Diagram_1"><bpmndi:BPMNPlane id="Plane_1" bpmnElement="checkout">
+<bpmndi:BPMNShape id="Start_di" bpmnElement="Start"><dc:Bounds x="40" y="182" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="GwDup_di" bpmnElement="GwDup" isMarkerVisible="true"><dc:Bounds x="120" y="175" width="50" height="50"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="GwB2b_di" bpmnElement="GwB2b" isMarkerVisible="true"><dc:Bounds x="230" y="175" width="50" height="50"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="Payment_di" bpmnElement="Payment"><dc:Bounds x="330" y="160" width="110" height="80"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="Inventory_di" bpmnElement="Inventory"><dc:Bounds x="500" y="160" width="110" height="80"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="Shipping_di" bpmnElement="Shipping"><dc:Bounds x="670" y="160" width="110" height="80"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="Notification_di" bpmnElement="Notification"><dc:Bounds x="840" y="160" width="110" height="80"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="PayErr_di" bpmnElement="PayErr"><dc:Bounds x="327" y="222" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="PayTimer_di" bpmnElement="PayTimer"><dc:Bounds x="367" y="222" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="PayComp_di" bpmnElement="PayComp"><dc:Bounds x="407" y="222" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="InvErr_di" bpmnElement="InvErr"><dc:Bounds x="517" y="222" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="InvComp_di" bpmnElement="InvComp"><dc:Bounds x="557" y="222" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="ShipErr_di" bpmnElement="ShipErr"><dc:Bounds x="682" y="222" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="ShipTimer_di" bpmnElement="ShipTimer"><dc:Bounds x="722" y="222" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="NotErr_di" bpmnElement="NotErr"><dc:Bounds x="852" y="222" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="HRefund_di" bpmnElement="HRefund"><dc:Bounds x="420" y="350" width="110" height="60"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="HRelease_di" bpmnElement="HRelease"><dc:Bounds x="560" y="350" width="110" height="60"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="ThrowComp_di" bpmnElement="ThrowComp"><dc:Bounds x="720" y="362" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="GwComp_di" bpmnElement="GwComp" isMarkerVisible="true"><dc:Bounds x="800" y="355" width="50" height="50"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="EndCompleted_di" bpmnElement="EndCompleted"><dc:Bounds x="1010" y="182" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="EndDuplicate_di" bpmnElement="EndDuplicate"><dc:Bounds x="127" y="330" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="EndFailed_di" bpmnElement="EndFailed"><dc:Bounds x="232" y="470" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="EndParked_di" bpmnElement="EndParked"><dc:Bounds x="312" y="470" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="EndCompensated_di" bpmnElement="EndCompensated"><dc:Bounds x="912" y="362" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNShape id="EndCompFailed_di" bpmnElement="EndCompFailed"><dc:Bounds x="807" y="470" width="36" height="36"/></bpmndi:BPMNShape>
+<bpmndi:BPMNEdge id="f1_di" bpmnElement="f1"><di:waypoint x="76" y="200"/><di:waypoint x="120" y="200"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f2_di" bpmnElement="f2"><di:waypoint x="170" y="200"/><di:waypoint x="230" y="200"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f3_di" bpmnElement="f3"><di:waypoint x="145" y="225"/><di:waypoint x="145" y="330"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f4_di" bpmnElement="f4"><di:waypoint x="280" y="200"/><di:waypoint x="330" y="200"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f5_di" bpmnElement="f5"><di:waypoint x="255" y="175"/><di:waypoint x="255" y="120"/><di:waypoint x="555" y="120"/><di:waypoint x="555" y="160"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f6_di" bpmnElement="f6"><di:waypoint x="440" y="200"/><di:waypoint x="500" y="200"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f7_di" bpmnElement="f7"><di:waypoint x="610" y="200"/><di:waypoint x="670" y="200"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f8_di" bpmnElement="f8"><di:waypoint x="780" y="200"/><di:waypoint x="840" y="200"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f9_di" bpmnElement="f9"><di:waypoint x="950" y="200"/><di:waypoint x="1010" y="200"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f10_di" bpmnElement="f10"><di:waypoint x="345" y="258"/><di:waypoint x="345" y="290"/><di:waypoint x="250" y="290"/><di:waypoint x="250" y="470"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f11_di" bpmnElement="f11"><di:waypoint x="385" y="258"/><di:waypoint x="385" y="306"/><di:waypoint x="330" y="306"/><di:waypoint x="330" y="470"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f12_di" bpmnElement="f12"><di:waypoint x="535" y="258"/><di:waypoint x="535" y="330"/><di:waypoint x="738" y="330"/><di:waypoint x="738" y="362"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f13_di" bpmnElement="f13"><di:waypoint x="700" y="258"/><di:waypoint x="700" y="330"/><di:waypoint x="738" y="330"/><di:waypoint x="738" y="362"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f14_di" bpmnElement="f14"><di:waypoint x="740" y="258"/><di:waypoint x="740" y="362"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f15_di" bpmnElement="f15"><di:waypoint x="870" y="258"/><di:waypoint x="870" y="330"/><di:waypoint x="738" y="330"/><di:waypoint x="738" y="362"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f16_di" bpmnElement="f16"><di:waypoint x="756" y="380"/><di:waypoint x="800" y="380"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f17_di" bpmnElement="f17"><di:waypoint x="850" y="380"/><di:waypoint x="912" y="380"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="f18_di" bpmnElement="f18"><di:waypoint x="825" y="405"/><di:waypoint x="825" y="470"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="a1_di" bpmnElement="a1"><di:waypoint x="425" y="258"/><di:waypoint x="425" y="350"/></bpmndi:BPMNEdge>
+<bpmndi:BPMNEdge id="a2_di" bpmnElement="a2"><di:waypoint x="575" y="258"/><di:waypoint x="575" y="350"/></bpmndi:BPMNEdge>
+</bpmndi:BPMNPlane></bpmndi:BPMNDiagram>
 </bpmn:definitions>
