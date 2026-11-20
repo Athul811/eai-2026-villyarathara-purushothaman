@@ -1,44 +1,98 @@
 # Architecture
 
-<!--
-Capstone architecture (README §6, R-6.1). Keep the two ## headings exactly as
-they are, and put one ```mermaid block under each. The stage 6 tests check
-that both are there, and that the integration diagram names at least 6 of the
-exchanges and queues in README §3.2. No manual points, but the defence starts
-here: you explain your system from these two diagrams.
-
-Comments like this one are prompts. They do not count as your text, and
-nobody grades them: delete each one when you have written its section.
-
-Mermaid renders on GitHub. Check yours there, or at https://mermaid.live.
--->
-
 ## System context
 
-<!--
-Your system from the outside: who sends it orders (web, mobile, a b2b
-partner), who operates it, and which providers it calls (pricing, payment,
-inventory, shipping, notification; Temporal if you build the advanced
-component). Your system can be one box here, or your four services.
-
-The syntax, not the answer. (A plain arrow is two dashes and a ">"; an HTML
-comment cannot show one, so this example uses the thick arrow.)
+Clients submit orders in three formats to one intake service. Everything after that runs through RabbitMQ. The providers (payment, inventory, shipping, notification) and the pricing service are external HTTP systems, here the kit's mocks. An operator watches the system through the observer and acts through endpoints on intake and the orchestrator.
 
 ```mermaid
 flowchart LR
-  partner[B2B partner] ==>|POST /orders, XML| intake
+  client["Clients: web JSON, mobile JSON, b2b XML"]
+  operator["Operator"]
+  pricing["pricing :4110"]
+  providers["payment, inventory, shipping, notification mocks :4801-4804"]
+  subgraph capstone["Order system, Docker Compose project capstone"]
+    intake["cap-intake :8800"]
+    orch["cap-orchestrator :8802"]
+    notifier["cap-notifier :8803"]
+    observer["cap-observer :8801"]
+    broker[("cap-rabbitmq")]
+  end
+  client -->|"POST /orders"| intake
+  intake -->|"enrich each item"| pricing
+  intake -->|"order.accepted"| broker
+  broker -->|"saga.queue"| orch
+  orch -->|"saga steps over HTTP"| providers
+  orch -->|"lifecycle and outcome events"| broker
+  broker -->|"failed, compensated"| notifier
+  notifier -->|"order_not_completed notice"| providers
+  intake -->|"hop records"| broker
+  orch -->|"hop records"| broker
+  notifier -->|"hop records"| broker
+  broker -->|"trace.store"| observer
+  operator -->|"GET /trace, GET /ops/metrics"| observer
+  operator -->|"GET /dlq, POST /dlq/replay"| intake
+  operator -->|"GET /sagas/stuck, POST /sagas/id/compensate"| orch
 ```
--->
 
 ## Integration architecture
 
-<!--
-Inside the system: your services, every exchange and queue of README §3.2,
-and the paths a message can take. Show the retry path (the retry queue and
-its way back), the DLQ and the invalid channel, the outcome events and who
-consumes them, and the wire tap into trace.store. Label an edge with its
-routing key where one matters.
+Every exchange and queue of the topology is shown. The solid paths are the business flow. The retry paths use a TTL queue and return to the origin queue only. After MAX_RETRIES attempts a message goes to the dead letter channel. A message that cannot be parsed goes to the invalid message channel and is never retried. Every service publishes hop records to the wire tap, and the observer stores them.
 
-Draw what your code does, not what the brief says. If your notifier
-consumes something the brief does not mention, it is in the diagram.
--->
+```mermaid
+flowchart TB
+  intake["intake"]
+  orch["orchestrator"]
+  notifier["notifier"]
+  observer["observer"]
+  OX["orders.exchange, fanout"]
+  SQ["saga.queue"]
+  RETX["orders.retry.exchange, direct"]
+  SRQ["saga.retry.queue, TTL 1 s"]
+  RET["orders.return.exchange, direct"]
+  OUT["orders.outcome, topic"]
+  NQ["notifications.queue"]
+  NRQ["notifications.retry.queue, TTL 1 s"]
+  DLX["orders.dlq.exchange, fanout"]
+  DLQ["orders.dlq"]
+  INVX["orders.invalid.exchange, fanout"]
+  INVQ["orders.invalid"]
+  TE["trace.events, fanout, wire tap"]
+  TS["trace.store"]
+  IOQ["intake.outcome.queue"]
+
+  intake -->|"order.accepted, persistent, confirmed"| OX
+  OX --> SQ
+  SQ --> orch
+  SQ -->|"nack, dead-letter"| RETX
+  RETX -->|"key saga.queue"| SRQ
+  SRQ -->|"after TTL"| RET
+  RET -->|"key saga.queue"| SQ
+  orch -->|"order.processing ... order.completed"| OUT
+  OUT -->|"order.failed, order.compensated"| NQ
+  OUT -->|"all events"| IOQ
+  IOQ -->|"order state view"| intake
+  NQ --> notifier
+  NQ -->|"nack, dead-letter"| RETX
+  RETX -->|"key notifications.queue"| NRQ
+  NRQ -->|"after TTL"| RET
+  RET -->|"key notifications.queue"| NQ
+  orch -->|"after MAX_RETRIES"| DLX
+  notifier -->|"after MAX_RETRIES"| DLX
+  DLX --> DLQ
+  intake -->|"POST /dlq/replay"| RET
+  orch -->|"malformed message"| INVX
+  notifier -->|"malformed message"| INVX
+  INVX --> INVQ
+  intake -.->|"hop records"| TE
+  orch -.->|"hop records"| TE
+  notifier -.->|"hop records"| TE
+  TE --> TS
+  TS --> observer
+```
+
+## Known limits
+
+- One instance of each service. Competing consumers are not used.
+- Outcome events are at-least-once. Intake and the notifier tolerate duplicates.
+- Hop records are fire-and-forget on a channel without confirms, so a hop can be lost. A lost hop never fails an order.
+- The saga.stuck and saga.operator_compensate hops have no causationId, because the orchestrator does not store the last hop of a crashed saga.

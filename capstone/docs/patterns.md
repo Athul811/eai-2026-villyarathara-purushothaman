@@ -1,37 +1,21 @@
 # Patterns
 
-<!--
-The integration patterns in your system, and where they are (README §6, R-6.3).
-
-What the stage 6 tests check: a table with the columns Pattern | Problem |
-Where | Why, at least 8 rows, a Normalizer row among them, and every Where
-link resolving to a file and a line that exist in your repository.
-
-What is judged (GRADING.md §5, M4): every row must be true at its link. A row
-that claims something your code does not do is a false row. One false row
-costs M4's point; more than one also costs up to 3 more points of the manual
-block. Eight true rows beat twelve rows with two wrong ones. At the defence I
-pick a row and you show me the code behind it.
-
-Where: link the line where the pattern happens, not the file's first line.
-Either form works:
-
-    [normalize.ts:42](../intake/src/normalize.ts#L42)    a link, resolved from docs/
-    intake/src/normalize.ts:42                           a bare path, from capstone/
-
-A pattern in two places can have two links. After you change the code,
-check that the lines still point where you mean.
-
-The course's patterns include: Normalizer, Message Translator, Content
-Enricher, Content Filter, Canonical Data Model, Content-Based Router,
-Idempotent Receiver, Guaranteed Delivery, Dead Letter Channel, Invalid
-Message Channel, Retry with a delay queue, Correlation Identifier, Wire Tap,
-Message Store, Process Manager / Saga, Compensating Transaction, Semantic
-Lock, Competing Consumers. List only the ones your code really has.
-
-Problem: what goes wrong without the pattern, in this system. Why: why this
-pattern and not another. One sentence each is enough.
--->
-
 | Pattern | Problem | Where | Why |
-|---|---|---|---|
+| --- | --- | --- | --- |
+| Normalizer | Three order formats (web JSON, mobile JSON, b2b XML) arrive on one endpoint | [translate.js:87](../intake/translate.js#L87) | Detects the format from the Content-Type and the body shape, then calls the matching translator. Unknown media type gives 415, an unrecognised JSON shape gives 400 |
+| Message Translator | Each source names and encodes the same facts differently | [translate.js:42](../intake/translate.js#L42), [translate.js:67](../intake/translate.js#L67) | One translator per source maps to the canonical order. The b2b one decodes windows-1257 from the XML declaration and turns decimal commas and dates into the canonical formats |
+| Content Filter | Payment data (card number, IBAN) must never travel on the bus | [translate.js:29](../intake/translate.js#L29) | Translators build the canonical object field by field, so payment, pan, pexp and PaymentDetails are never copied. The canonical schema has no field for them either |
+| Content Enricher | Source orders carry no trustworthy price | [server.js:70](../intake/server.js#L70) | Every item is enriched from the pricing service: unitPrice, currency and taxRate. A 404 rejects the order with 422, an outage gives 503 |
+| Canonical Data Model | Downstream services should not know three formats | [server.js:30](../intake/server.js#L30) | Intake validates every translated order against the course canonical schema before publishing. The orchestrator validates again on consume |
+| Correlation Identifier | One order must be followed across HTTP, queues, mocks and traces | [server.js:139](../intake/server.js#L139) | Intake generates one UUID v4 per accepted submission. It travels in the correlationId header and in X-Correlation-Id on calls to the mocks |
+| Idempotent Receiver | A client retry must not create a second order | [server.js:121](../intake/server.js#L121) | The Idempotency-Key and the SHA-256 of the raw body are stored in idempotency-store.json. Same key and body replays the stored response with no publish. Same key and another body gives 409 |
+| Guaranteed Delivery | An accepted order must not be lost between HTTP and the broker | [server.js:52](../intake/server.js#L52) | The event is persistent and published on a confirm channel. The 202 is sent only after the broker confirms. If it does not, the client gets 503 and the key is freed |
+| Content-Based Router | b2b orders are invoiced, so they have no payment step | [server.js:242](../orchestrator/server.js#L242) | The saga picks its step list from orderType, not from source |
+| Process Manager / Compensating Transaction | A multi-step order needs all-or-nothing behaviour across four providers | [server.js:241](../orchestrator/server.js#L241), [server.js:124](../orchestrator/server.js#L124) | The orchestrator runs the steps in order and, when a later step fails, undoes the completed ones in reverse (inventory release, then payment refund) with provider idempotency keys |
+| Semantic Lock | Other readers must see that an order is in flight | [server.js:235](../orchestrator/server.js#L235) | order.processing is published before the first step. Intake follows it and GET /orders shows processing |
+| Idempotent Consumer | A redelivered or duplicate message must not run twice | [server.js:210](../orchestrator/server.js#L210), [server.js:109](../notifier/server.js#L109) | The orchestrator dedupes on businessKey and the notifier on correlationId. Both indexes are stored on disk and survive a restart |
+| Retry with a delay queue | A temporary failure should be retried later, not in a hot loop | [server.js:122](../notifier/server.js#L122), [server.js:254](../orchestrator/server.js#L254) | A failed attempt is nacked without requeue. The queue dead-letters it into its retry queue, whose 1 s TTL (rabbitmq/definitions.json) sends it back to the origin queue |
+| Dead Letter Channel | A message that keeps failing must not block the queue or be lost | [server.js:124](../notifier/server.js#L124) | After MAX_RETRIES attempts the message is published to orders.dlq.exchange with originQueue and lastError, then acked. GET /dlq lists it and POST /dlq/replay republishes it |
+| Invalid Message Channel | A malformed message is not worth retrying | [server.js:165](../orchestrator/server.js#L165) | Unparseable or schema-invalid messages go to orders.invalid with their original bytes and headers, and are acked |
+| Wire Tap | Operators need the journey of one order without slowing it down | [hops.js:26](../intake/hops.js#L26) | Each service publishes hop records to the trace.events fanout on a separate channel without confirms. A failure there is swallowed, so a hop can be lost but never fails an order |
+| Message Store | The hops must be queryable later and survive a restart | [server.js:46](../observer/server.js#L46) | The observer appends each hop to trace-store.jsonl and rebuilds its index from that file at start. GET /trace/:cid reads it |
