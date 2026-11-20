@@ -216,7 +216,7 @@ async function runSaga(msg, order, cid, saga, ctx, h) {
         const attempts = retryCount(h) + 1;
         if (attempts < MAX_RETRIES) return nack(msg);
         await confirmPub("orders.dlq.exchange", "", msg.content, { persistent: true, messageId: randomUUID(),
-          headers: { ...h, originQueue: "saga.queue", lastError: r.code, causationId: randomUUID() } });
+          headers: { ...h, originQueue: "saga.queue", attempts, lastError: r.code, causationId: randomUUID() } });
         await setOutcome(cid, saga, "order.parked", envelope(ctx, cid, "parked", { code: r.code }));
         return ack(msg);
       }

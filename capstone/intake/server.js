@@ -206,3 +206,81 @@ function applyOutcome(env) {
   v.updatedAt = new Date().toISOString();
   save("orders.json", orders);
 }
+
+// ---------- DLQ operations (R-4.6) ----------
+function confirmPublish(exchange, key, content, options) {
+  return new Promise((resolve, reject) => {
+    if (!ch) return reject(new Error("no broker"));
+    const t = setTimeout(() => reject(new Error("confirm timeout")), 5000);
+    try { ch.publish(exchange, key, content, options, (e) => { clearTimeout(t); e ? reject(e) : resolve(); }); }
+    catch (e) { clearTimeout(t); reject(e); }
+  });
+}
+const withoutRetryHistory = (h) => Object.fromEntries(Object.entries(h || {}).filter(([k]) =>
+  !/^x-(death|first-death|last-death)/.test(k) && !["attempts", "lastError", "originQueue", "deadLetteredAt"].includes(k)));
+
+let dlqLock = Promise.resolve();
+const withDlq = (fn) => { const run = dlqLock.then(fn, fn); dlqLock = run.catch(() => {}); return run; };
+
+async function readDlq(rc) {
+  const msgs = [];
+  for (;;) { const m = await rc.get("orders.dlq", { noAck: false }); if (!m) break; msgs.push(m); }
+  return msgs;
+}
+function entryOf(m) {
+  const h = m.properties.headers || {};
+  let attempts = Number(h.attempts);
+  if (!Number.isFinite(attempts) || attempts < 1) {
+    const d = Array.isArray(h["x-death"]) ? h["x-death"].filter((e) => e.queue === h.originQueue && e.reason === "rejected")
+      .reduce((n, e) => n + Number(e.count || 0), 0) : 0;
+    attempts = d + 1;
+  }
+  return { messageId: m.properties.messageId || "", correlationId: String(h.correlationId ?? ""),
+    originQueue: String(h.originQueue ?? ""), attempts, lastError: String(h.lastError ?? ""),
+    deadLetteredAt: h.deadLetteredAt ? String(h.deadLetteredAt)
+      : (m.properties.timestamp ? new Date(m.properties.timestamp * 1000).toISOString() : new Date().toISOString()) };
+}
+
+app.get("/dlq", async (_req, res) => {
+  if (!conn) return res.status(503).json({ code: "broker_unavailable" });
+  try {
+    const entries = await withDlq(async () => {
+      const rc = await conn.createChannel(); rc.on("error", () => {});
+      try {
+        const msgs = await readDlq(rc);
+        const out = msgs.map(entryOf);
+        msgs.forEach((m) => rc.nack(m, false, true));        // non-destructive: put them all back
+        return out;
+      } finally { try { await rc.close(); } catch {} }
+    });
+    res.json({ count: entries.length, entries });
+  } catch (e) { console.error(e); res.status(500).json({ code: "internal_error" }); }
+});
+
+app.post("/dlq/replay", express.json(), async (req, res) => {
+  if (!conn || !ch) return res.status(503).json({ code: "broker_unavailable" });
+  const want = req.body && typeof req.body === "object" ? req.body.correlationId : undefined;
+  try {
+    const result = await withDlq(async () => {
+      const rc = await conn.createChannel(); rc.on("error", () => {});
+      try {
+        const msgs = await readDlq(rc);
+        let replayed = 0;
+        for (const m of msgs) {
+          const e = entryOf(m);
+          if ((want && e.correlationId !== want) || !e.originQueue) { rc.nack(m, false, true); continue; }
+          const headers = withoutRetryHistory(m.properties.headers);
+          headers.causationId = randomUUID();                // the dlq.replay hop (step 5 will record it)
+          try {
+            await confirmPublish("orders.return.exchange", e.originQueue, m.content, {
+              persistent: true, messageId: randomUUID(), headers,
+              ...(m.properties.contentType ? { contentType: m.properties.contentType } : {}) });
+            rc.ack(m); replayed++;                           // ack only after the confirmed republish
+          } catch { rc.nack(m, false, true); }
+        }
+        return { replayed, remaining: msgs.length - replayed };
+      } finally { try { await rc.close(); } catch {} }
+    });
+    res.json(result);
+  } catch (e) { console.error(e); res.status(500).json({ code: "internal_error" }); }
+});
