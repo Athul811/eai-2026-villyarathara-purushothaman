@@ -38,6 +38,7 @@ async function connect() {
     ch = await conn.createConfirmChannel();
     ch.on("error", () => {});
     ch.on("close", () => { ch = null; conn?.close().catch(() => {}); });
+    await startOutcomeConsumer();
   } catch {
     ch = null;
     try { await conn?.close(); } catch {}
@@ -83,9 +84,9 @@ async function price(productId, correlationId, causationId) {
 // ---------- HTTP ----------
 const app = express();
 app.get("/health", (_req, res) => {
-  const up = conn !== null && ch !== null;
+  const up = conn !== null && ch !== null && outcomeUp;
   res.status(up ? 200 : 503).json({ status: up ? "ok" : "degraded",
-    checks: { broker: up ? "up" : "down", consumers: {} } });
+    checks: { broker: up ? "up" : "down", consumers: { "intake.outcome.queue": outcomeUp ? 1 : 0 } } });
 });
 
 app.get("/orders/:cid", (req, res) => {
@@ -154,7 +155,7 @@ app.post("/orders", express.raw({ type: () => true, limit: "2mb" }), async (req,
       release();
       return reply(503, { code: "broker_unavailable" }, { "Retry-After": "1" });
     }
-    orders[correlationId] = { correlationId, businessKey, orderId: order.orderId, source: order.source,
+    if (!orders[correlationId]) orders[correlationId] = { correlationId, businessKey, orderId: order.orderId, source: order.source,
       orderType: order.orderType, state: "accepted", updatedAt: new Date().toISOString() };
     save("orders.json", orders);
     idem[key].correlationId = correlationId;
@@ -169,3 +170,39 @@ app.post("/orders", express.raw({ type: () => true, limit: "2mb" }), async (req,
 });
 
 app.listen(PORT, () => console.log(`intake listening on ${PORT}`));
+
+let outcomeUp = false;
+const ANY_OUTCOME = ["parked", "completed", "failed", "compensated", "compensation_failed", "needs_attention", "duplicate"];
+const MOVES = {
+  processing: ANY_OUTCOME.filter((s) => s !== "duplicate"),
+  parked: ["processing", ...ANY_OUTCOME.filter((s) => s !== "duplicate" && s !== "parked")],
+  compensation_failed: ["compensated", "compensation_failed"],
+  needs_attention: ["compensated", "compensation_failed"],
+};
+async function startOutcomeConsumer() {
+  const oc = await conn.createChannel();
+  oc.on("error", () => {});
+  oc.on("close", () => { outcomeUp = false; });
+  await oc.assertQueue("intake.outcome.queue", { durable: true });
+  await oc.bindQueue("intake.outcome.queue", "orders.outcome", "#");
+  await oc.prefetch(20);
+  await oc.consume("intake.outcome.queue", (msg) => {
+    if (!msg) return;
+    try { applyOutcome(JSON.parse(msg.content.toString("utf8"))); } catch (e) { console.error(e); }
+    try { oc.ack(msg); } catch {}
+  });
+  outcomeUp = true;
+}
+function applyOutcome(env) {
+  if (!env?.correlationId || !env.state) return;
+  let v = orders[env.correlationId];
+  if (!v) v = orders[env.correlationId] = { correlationId: env.correlationId, businessKey: env.businessKey,
+    orderId: env.orderId, source: env.source, orderType: env.orderType, state: "accepted", updatedAt: new Date().toISOString() };
+  const ok = v.state === "accepted" || (MOVES[v.state] || []).includes(env.state);
+  if (!ok) return;
+  v.state = env.state;
+  if (env.code !== undefined) v.code = env.code; else delete v.code;
+  if (env.duplicateOf !== undefined) v.duplicateOf = env.duplicateOf; else delete v.duplicateOf;
+  v.updatedAt = new Date().toISOString();
+  save("orders.json", orders);
+}
